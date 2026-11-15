@@ -1,0 +1,2 @@
+module humanos-updates.lib
+singleton Paths 1.0 Paths.qml

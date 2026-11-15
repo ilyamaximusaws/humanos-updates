@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+# omarchy:summary=Report Omarchy, repo, AUR, Flatpak and plugin updates as JSON for the humanos-updates badge.
+#
+# Emits one JSON object on stdout and always exits 0. The widget treats a
+# missing "state" key as "unknown" and keeps the previous badge, so a broken
+# check can never be read as "everything is fine".
+#
+# state: clean   -> no Omarchy update, few extras, last full upgrade recent
+#        updates -> Omarchy update, or too many extras queued
+#        stale   -> no full system upgrade for >= STALE_AFTER_DAYS
+#
+# A source that could not be checked is reported in `sources` as "fail", which
+# sets `degraded: true`. A degraded run never overwrites the cache and echoes
+# the previous answer instead, so a machine that boots without network does not
+# turn a known "updates" into "clean" and then forget it. Statuses are ok /
+# fail / skip (skip = the source does not exist here, e.g. no flatpak).
+#
+# Mechanisms are the ones OmaControl already uses, so the two agree:
+#   repo packages : checkupdates (temporary db, no lock); rc 0 = updates,
+#                   rc 2 = none, anything else = could not check
+#   AUR           : yay -Qua, behind omarchy-pkg-aur-accessible
+#   plugins       : omacontrol plugin updates (one git fetch per plugin)
+#   flatpak       : flatpak remote-ls --updates
+#
+# Every source also reports its package list, so the dropdown can show what is
+# actually waiting instead of only a count.
+
+set -uo pipefail
+
+STALE_AFTER_DAYS=7
+# "not so many" third-party updates: at or below this the dot stays green when
+# Omarchy itself has nothing waiting.
+EXTRAS_GREEN_MAX=5
+OMACONTROL="$HOME/.config/omarchy/plugins/io.github.twiking.omacontrol/bin/omacontrol"
+PACMAN_LOG=/var/log/pacman.log
+
+cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy"
+cache_file="$cache_dir/humanos-update-cache.json"
+log_file="$cache_dir/humanos-update-check.log"
+
+now_ms() {
+  local v
+  v=$(date +%s%3N 2>/dev/null || true)
+  [[ -n $v ]] || v=$(( $(date +%s) * 1000 ))
+  printf '%s' "$v"
+}
+
+start_ms=$(now_ms)
+checked_at=$(date -Iseconds)
+
+# Empty by default, so a source that fails reports nothing rather than leaving
+# a stale array behind.
+repo_packages="[]"
+aur_packages="[]"
+flatpak_packages="[]"
+plugin_packages="[]"
+
+# Source verdicts: ok | fail | skip. "skip" means the source is not installed
+# here, so it is not evidence of anything; "fail" means we could not check it.
+sources_repo="skip"
+sources_aur="skip"
+sources_flatpak="skip"
+sources_plugins="skip"
+
+repo_count=0
+aur_count=0
+flatpak_count=0
+plugin_count=0
+
+omarchy_available=false
+omarchy_from=""
+omarchy_to=""
+
+# ------------------------------------------------------------------- online?
+# Only a fast gate: NetworkManager can still report "online" while the default
+# route is broken, so the per-source verdicts below are what actually decide.
+network_ready=true
+if command -v nm-online >/dev/null 2>&1; then
+  nm-online -q -t 15 >/dev/null 2>&1 || network_ready=false
+fi
+
+# ------------------------------------------------------------------- Omarchy
+# checkupdates is the single source for both the repo list and the Omarchy line:
+# omarchy-update-available ran it again, so a boot-race produced two different
+# answers from one tool.
+if [[ $network_ready == true ]]; then
+  sources_repo="fail"
+  repo_raw=$(timeout 90 checkupdates --nocolor 2>/dev/null)
+  repo_rc=$?
+  if (( repo_rc == 0 )); then
+    sources_repo="ok"
+  elif (( repo_rc == 2 )); then
+    # checkupdates exits 2 when there is nothing to do.
+    sources_repo="ok"
+    repo_raw=""
+  fi
+
+  if [[ -n $repo_raw ]]; then
+    # "<name> <old> -> <new>"; keep both versions so the row can show the move.
+    repo_packages=$(printf '%s\n' "$repo_raw" |
+      awk 'NF >= 4 && $3 == "->" { printf "%s\t%s\t%s\n", $1, $2, $4 }' |
+      jq -R 'split("\t") | { name: .[0], from: .[1], to: .[2] }' | jq -s .)
+    repo_count=$(jq -r 'length' <<<"$repo_packages")
+
+    omarchy_line=$(printf '%s\n' "$repo_raw" |
+      grep -E '^omarchy(-dev)?[[:space:]]+[^[:space:]]+[[:space:]]+->[[:space:]]+[^[:space:]]+' |
+      head -1 || true)
+    if [[ -n $omarchy_line ]]; then
+      omarchy_from=$(awk '{ print $2 }' <<<"$omarchy_line")
+      omarchy_to=$(awk '{ print $4 }' <<<"$omarchy_line")
+      omarchy_available=true
+    fi
+  fi
+else
+  sources_repo="fail"
+fi
+
+# ---------------------------------------------------------------- repo + AUR
+if [[ $network_ready == true ]] && command -v yay >/dev/null 2>&1; then
+  if omarchy-pkg-aur-accessible >/dev/null 2>&1; then
+    sources_aur="fail"
+    aur_err_file=$(mktemp)
+    aur_raw=$(timeout 90 yay -Qua 2>"$aur_err_file" || true)
+    aur_err=$(cat "$aur_err_file" || true)
+    rm -f "$aur_err_file"
+    if [[ -n $aur_raw ]]; then
+      # AUR lines carry a trailing "[age]" column; the arrow split drops it.
+      sources_aur="ok"
+      aur_packages=$(printf '%s\n' "$aur_raw" |
+        awk 'NF >= 4 && $3 == "->" { printf "%s\t%s\t%s\n", $1, $2, $4 }' |
+        jq -R 'split("\t") | { name: .[0], from: .[1], to: .[2] }' | jq -s .)
+      aur_count=$(jq -r 'length' <<<"$aur_packages")
+    elif [[ -n $aur_err ]]; then
+      # Empty stdout with something on stderr is a failure, not "no updates":
+      # yay exits 1 both ways, so the code alone cannot tell them apart.
+      sources_aur="fail"
+    else
+      sources_aur="ok"
+    fi
+  else
+    # AUR is reachable: the check above is a live curl, so failing it means we
+    # could not verify, not that there is nothing to install.
+    sources_aur="fail"
+  fi
+fi
+
+# ------------------------------------------------------------------ flatpak
+if command -v flatpak >/dev/null 2>&1; then
+  sources_flatpak="fail"
+  if [[ $network_ready == true ]]; then
+    flatpak_raw=$(timeout 120 flatpak remote-ls --updates 2>/dev/null)
+    flatpak_rc=$?
+    if (( flatpak_rc == 0 )); then
+      sources_flatpak="ok"
+      if [[ -n $flatpak_raw ]]; then
+        # TSV: <remote>\t<application>\t\t<branch>\t<arch>. One line per arch and
+        # branch, so dedupe on the application id to keep an app from counting
+        # twice; the branch differs per line and is not worth showing.
+        flatpak_packages=$(printf '%s\n' "$flatpak_raw" |
+          awk -F'\t' 'NF >= 4 && $2 != "" { print $2 }' | sort -u |
+          jq -R '{ name: . }' | jq -s .)
+        flatpak_count=$(jq -r 'length' <<<"$flatpak_packages")
+      fi
+    fi
+  fi
+fi
+
+# ------------------------------------------------------------------ plugins
+# omacontrol spells its verdicts out: -1 is "not a git checkout", -2 "fetch
+# failed", -3 "remote carries credentials". Only the last two are a source we
+# failed to read.
+if [[ -x $OMACONTROL ]]; then
+  sources_plugins="fail"
+  if [[ $network_ready == true ]]; then
+    plugin_raw=$(timeout 240 "$OMACONTROL" plugin updates 2>/dev/null || true)
+    if [[ -n $plugin_raw ]]; then
+      plugin_rows=$(printf '%s\n' "$plugin_raw" |
+        awk -F'\t' 'NF >= 2 && $2 ~ /^-?[0-9]+$/ { printf "%s\t%s\t%s\n", $1, $2, $3 }')
+      plugin_failed=$(awk -F'\t' '$2 ~ /^-[23]$/ { n++ } END { print n + 0 }' <<<"$plugin_rows")
+      if (( plugin_failed > 0 )); then
+        sources_plugins="fail"
+      else
+        sources_plugins="ok"
+        if [[ -n $plugin_rows ]]; then
+          plugin_packages=$(printf '%s\n' "$plugin_rows" |
+            awk -F'\t' '$2 ~ /^[0-9]+$/ && $2 > 0 { printf "%s\t%s\t%s\n", $1, $2, $3 }' |
+            jq -R 'split("\t") | { name: .[0], behind: (.[1] | tonumber), to: .[2] }' | jq -s .)
+          plugin_count=$(jq -r 'length' <<<"$plugin_packages")
+        fi
+      fi
+    else
+      sources_plugins="ok"
+    fi
+  fi
+fi
+
+sources_json=$(jq -nc \
+  --arg repo "$sources_repo" \
+  --arg aur "$sources_aur" \
+  --arg flatpak "$sources_flatpak" \
+  --arg plugins "$sources_plugins" \
+  '{ repo: $repo, aur: $aur, flatpak: $flatpak, plugins: $plugins }')
+
+degraded=false
+for name in repo aur flatpak plugins; do
+  var="sources_$name"
+  [[ ${!var} == fail ]] && degraded=true
+done
+
+# ------------------------------------------- time since the last full upgrade
+days_since=-1
+last_upgrade=""
+
+last_line=$(grep -E '\] \[PACMAN\] starting full system upgrade' "$PACMAN_LOG" 2>/dev/null | tail -1)
+if [[ -n $last_line ]]; then
+  last_upgrade=$(sed -E 's/^\[([^]]+)\].*/\1/' <<<"$last_line")
+  ts=$(date -d "$last_upgrade" +%s 2>/dev/null || true)
+  if [[ -n $ts ]]; then
+    days_since=$(( ( $(date +%s) - ts ) / 86400 ))
+  fi
+fi
+
+extras_count=$(( repo_count + aur_count + flatpak_count + plugin_count ))
+
+duration_ms=$(( $(now_ms) - start_ms ))
+
+mkdir -p "$cache_dir"
+
+if [[ $degraded == true ]]; then
+  # Keep the last answer. Echoing it with degraded:true lets the widget reject
+  # the payload and hold its badge, while still showing why.
+  prior=""
+  [[ -f $cache_file ]] && prior=$(cat "$cache_file" 2>/dev/null || true)
+  if [[ -n $prior ]] && jq -e '(.state | type) == "string"' <<<"$prior" >/dev/null 2>&1; then
+    json=$(jq -nc --argjson prior "$prior" \
+      --arg checkedAt "$checked_at" --argjson durationMs "$duration_ms" \
+      --argjson sources "$sources_json" \
+      '$prior + { degraded: true, checkedAt: $checkedAt, durationMs: $durationMs, sources: $sources }')
+  else
+    json=$(jq -nc --arg checkedAt "$checked_at" --argjson durationMs "$duration_ms" \
+      --argjson sources "$sources_json" \
+      '{ degraded: true, checkedAt: $checkedAt, durationMs: $durationMs, sources: $sources }')
+  fi
+  printf '%s | degraded | %sms | repo=%s aur=%s flatpak=%s plugins=%s | extras=%d\n' \
+    "$checked_at" "$duration_ms" "$sources_repo" "$sources_aur" "$sources_flatpak" \
+    "$sources_plugins" "$extras_count" >>"$log_file"
+  printf '%s\n' "$json"
+  exit 0
+fi
+
+# -------------------------------------------------------------------- state
+# Omarchy itself is the update that matters; the rest stay green while there
+# are only a few of them.
+state="clean"
+if (( days_since >= STALE_AFTER_DAYS )); then
+  state="stale"
+elif [[ $omarchy_available == true ]] || (( extras_count > EXTRAS_GREEN_MAX )); then
+  state="updates"
+fi
+
+json=$(jq -n \
+  --argjson omarchyAvailable "$omarchy_available" \
+  --arg omarchyFrom "$omarchy_from" \
+  --arg omarchyTo "$omarchy_to" \
+  --argjson repoCount "$repo_count" \
+  --argjson aurCount "$aur_count" \
+  --argjson flatpakCount "$flatpak_count" \
+  --argjson pluginCount "$plugin_count" \
+  --argjson repoPackages "$repo_packages" \
+  --argjson aurPackages "$aur_packages" \
+  --argjson flatpakPackages "$flatpak_packages" \
+  --argjson pluginPackages "$plugin_packages" \
+  --argjson extrasCount "$extras_count" \
+  --argjson extrasGreenMax "$EXTRAS_GREEN_MAX" \
+  --argjson daysSince "$days_since" \
+  --arg lastUpgrade "$last_upgrade" \
+  --argjson staleAfter "$STALE_AFTER_DAYS" \
+  --arg checkedAt "$checked_at" \
+  --argjson durationMs "$duration_ms" \
+  --argjson sources "$sources_json" \
+  --arg state "$state" \
+  '{
+     state: $state,
+     degraded: false,
+     checkedAt: $checkedAt,
+     durationMs: $durationMs,
+     sources: $sources,
+     omarchy: { available: $omarchyAvailable, from: $omarchyFrom, to: $omarchyTo },
+     counts: {
+       repo: $repoCount,
+       aur: $aurCount,
+       flatpak: $flatpakCount,
+       plugins: $pluginCount,
+       extras: $extrasCount
+     },
+     packages: {
+       repo: $repoPackages,
+       aur: $aurPackages,
+       flatpak: $flatpakPackages,
+       plugins: $pluginPackages
+     },
+     extrasGreenMax: $extrasGreenMax,
+     lastUpgrade: $lastUpgrade,
+     daysSinceUpgrade: $daysSince,
+     staleAfterDays: $staleAfter
+   }')
+
+# Publish before printing: the badge reads this file synchronously at shell
+# start, so a fresh session shows the last known state instead of a placeholder
+# for the length of the check. Written to a temp name and renamed, so a reader
+# never sees a half-written file.
+tmp="$cache_dir/humanos-update-cache.json.$$"
+if printf '%s\n' "$json" >"$tmp" 2>/dev/null; then
+  mv -f "$tmp" "$cache_file" 2>/dev/null || rm -f "$tmp"
+fi
+
+printf '%s | %s | %sms | repo=%s aur=%s flatpak=%s plugins=%s | extras=%d\n' \
+  "$checked_at" "$state" "$duration_ms" "$sources_repo" "$sources_aur" \
+  "$sources_flatpak" "$sources_plugins" "$extras_count" >>"$log_file"
+
+printf '%s\n' "$json"

@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "humanos-updates",
+  "name": "humanos-updates",
+  "version": "1.0.0",
+  "author": "Iliya Brook",
+  "license": "MIT",
+  "repository": "https://github.com/ilyamaximusaws/humanos-updates",
+  "description": "Update badge for the bar: the capsule shows how many updates are waiting (0 when everything is current), the dropdown lists what is waiting (Omarchy, repository packages, AUR, Flatpak, plugins), and a check that could not reach its sources says so instead of pretending nothing is waiting.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "HumanosUpdatesBarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Updates",
+    "description": "Number of waiting updates with a per-source dropdown",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "left",
+    "defaults": {},
+    "schema": []
+  }
+}

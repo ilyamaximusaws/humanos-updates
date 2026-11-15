@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# omarchy:summary=Run the update the humanos-updates badge was asked for.
+#
+# The badge's dropdown calls this inside the floating update terminal, so the
+# same three entry points the Omarchy menu uses are the ones wired here:
+#   system   -> omarchy-update        (keyring, system pkgs, migrations, AUR)
+#   packages -> the per-manager update commands, one per filter
+#   plugins  -> omarchy-plugin-update (git-managed shell plugins)
+set -uo pipefail
+
+target="${1:-}"
+filter="${2:-all}"
+
+run() {
+  echo -e "\e[36m==>\e[0m $*"
+  "$@"
+}
+
+case "$target" in
+  system)
+    run omarchy-update
+    ;;
+  packages)
+    case "$filter" in
+      repo)    run omarchy-update-system-pkgs ;;
+      aur)     run omarchy-update-aur-pkgs ;;
+      flatpak) run flatpak update -y ;;
+      *)
+        run omarchy-update-system-pkgs
+        run omarchy-update-aur-pkgs
+        run flatpak update -y
+        ;;
+    esac
+    ;;
+  plugins)
+    run omarchy-plugin-update --yes
+    ;;
+  *)
+    echo "usage: humanos-update-run <system|packages|plugins> [all|repo|aur|flatpak]" >&2
+    exit 2
+    ;;
+esac
