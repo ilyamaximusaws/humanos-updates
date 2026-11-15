@@ -267,7 +267,10 @@ BarWidget {
       width: row.implicitWidth + Style.space(20)
       height: parent.height - Style.space(8)
       radius: height / 2
-      color: "#f2f2f2"
+      // Subtle chip instead of the hard white pill (#f2f2f2) that stood out
+      // against the bar: a light wash of the theme's own text colour, so it
+      // follows every theme and stays quiet on a dark bar.
+      color: Qt.alpha(root.theme.popups.text, 0.12)
 
       Row {
         id: row
@@ -287,7 +290,7 @@ BarWidget {
         Text {
           textFormat: Text.PlainText
           text: root.capsuleLabel
-          color: "#171717"
+          color: root.theme.popups.text
           font.family: root.bar ? root.bar.fontFamily : Style.font.family
           font.pixelSize: Style.font.caption
           font.weight: Font.Medium
@@ -297,7 +300,7 @@ BarWidget {
         Text {
           // Font Awesome arrows-rotate; present in Maple Mono NF.
           text: "\uf2f1"
-          color: "#171717"
+          color: root.theme.popups.text
           font.family: root.bar ? root.bar.fontFamily : Style.font.family
           font.pixelSize: Style.font.body
           anchors.verticalCenter: parent.verticalCenter
